@@ -40,13 +40,17 @@ The OpenSearch kNN plugin also just feels relevant right now. Vector search is e
 
 ### Environment Setup
 
-[Notes on setting up your local development environment - challenges you faced, how you solved them]
+This one took a bit more time to get running than a typical project — OpenSearch is a full distributed search engine, so there's more moving parts. I cloned my fork, set up the Java environment (the project requires JDK 21), and ran ./gradlew build -x test to get the initial build going. Hit a few issues with missing --add-modules jdk.incubator.vector flags not being set up yet, which is actually related to the issue itself — the TODO comments in the code mention this exact flag as a prerequisite for enabling the Vector API. Got the test suite running with ./gradlew test.
 
 ### Steps to Reproduce
 
-1. [Step 1]
-2. [Step 2]
-3. [Observed result]
+1. Clone the repo and navigate to src/main/java/org/opensearch/knn/plugin/script/KNNScoringUtil.java
+2. Look at l2SquaredADC (lines ~114–130) and innerProductADC (lines ~145–175) — both loop through each dimension one at a time with plain scalar arithmetic
+3. The TODO comments in both methods explicitly flag this as inefficient and call out SIMD via FloatVector.SPECIES_PREFERRED as the intended fix
+4. Expected: The ADC distance methods process multiple dimensions per CPU instruction using the Java Vector API, getting meaningful throughput improvement on modern hardware
+5. Actual: Both methods use a scalar loop — no vectorization, no SIMD, processing one element at a time
+
+The "bug" here is less a crash and more a performance gap that the original author left with explicit TODOs. Running a microbenchmark (or just reading the code) makes it clear there's no batching happening.
 
 ### Reproduction Evidence
 
@@ -70,20 +74,22 @@ The OpenSearch kNN plugin also just feels relevant right now. Vector search is e
 
 Using UMPIRE framework (adapted):
 
-**Understand:** [Restate the problem]
+**Understand:** ADC (Asymmetric Distance Computation) is a technique used during vector search where one vector is stored in compressed binary format and the other is a full-precision float query vector. The distance computation has to unpack bits one at a time right now, which is slow. The Java Vector API (available since JDK 16 as an incubator module, stabilized in JDK 21) lets you do the same math on multiple floats simultaneously using SIMD instructions. The TODOs in l2SquaredADC and innerProductADC are asking for exactly this.
 
-**Match:** [What similar patterns/solutions exist in the codebase?]
+**Match:** The existing l2Squared and innerProduct methods for float-float and byte-byte cases already delegate to VectorUtil from Apache Lucene, which handles SIMD internally. The ADC methods can't use those because the mixed float/binary input format isn't supported there — so this needs a custom implementation using jdk.incubator.vector (or the stable java.lang.foreign / Vector API in JDK 21+). Looking at how other performance-sensitive parts of the codebase use Lucene's VectorUtil gives a good sense of the pattern.
 
-**Plan:** [Step-by-step implementation plan]
-1. [Modify file X to do Y]
-2. [Add function Z]
-3. [Update tests]
+**Plan:** 
+1. Add the --add-modules jdk.incubator.vector JVM flag and any needed build.gradle config as the TODO comments suggest (this may already exist elsewhere in the project — worth checking)
+2. Rewrite l2SquaredADC to use FloatVector.SPECIES_PREFERRED, processing the query vector in chunks matching the SIMD lane width, and accumulating the squared differences with reduceLanes(ADD)
+3. Do the same for innerProductADC — load chunks of the query vector, multiply by the corresponding unpacked bit values, and reduce
+4. Keep the scalar fallback path for dimensions that don't divide evenly into the lane width (the tail loop)
+5. Write unit tests comparing the SIMD and scalar outputs for correctness, and ideally a JMH microbenchmark to show the throughput improvement
 
-**Implement:** [Link to your branch/commits as you work]
+**Implement:** https://github.com/krisharaut/k-NN
 
-**Review:** [Self-review checklist - does it follow the project's contribution guidelines?]
+**Review:** Will read CONTRIBUTING.md and the project's PR template before opening. This is a performance change so I'll make sure the PR includes before/after benchmark numbers — that seems like the kind of thing maintainers on a project like this will ask for anyway.
 
-**Evaluate:** [How will you verify it works?]
+**Evaluate:** Unit tests checking that l2SquaredADC and innerProductADC return the same values as the old scalar implementation across various vector sizes (including non-power-of-two lengths to test the tail loop). Then a JMH benchmark on a reasonably large vector dimension (e.g. 768 or 1536, typical embedding sizes) to show wall-clock improvement.
 
 ---
 
