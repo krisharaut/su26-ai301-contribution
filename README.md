@@ -1,10 +1,10 @@
 # su26-ai301-contribution
 # Contribution [#1]: [Enhancement] Integrate SIMD with ADC distance computation
 
-**Contribution Number:** [1 / 2 / 3]  
+**Contribution Number:** [3]  
 **Student:** Krisha Raut  
 **Issue:** https://github.com/opensearch-project/k-NN/issues/3150  
-**Status:** Phase I Complete
+**Status:** Phase III Complete
 
 ---
 
@@ -94,6 +94,11 @@ Using UMPIRE framework (adapted):
 ---
 
 ## Testing Strategy
+What I added in KNNScoringUtilTests.java:
+
+1. L2 parity test: keeps a copy of the original scalar loop as a reference oracle and asserts the new SIMD l2SquaredADC matches it within 1e-4f, across dimensions both divisible and not divisible by the lane width.
+2. Inner product parity test: same approach for innerProductADC, including all-zeros and all-ones binary vectors.
+3. Boundary test: dimensions 8, 768, 1536, and an awkward value like 1000 to exercise chunk + tail handling.
 
 ### Unit Tests
 
@@ -114,9 +119,26 @@ Using UMPIRE framework (adapted):
 
 ## Implementation Notes
 
-### Week [X] Progress
+### Week 3 Progress
 
-[What you built this week, challenges faced, decisions made]
+What I built:
+
+1. Added --add-modules=jdk.incubator.vector to the test/build JVM args in build.gradle so the incubator Vector API resolves. 
+2. Rewrote l2SquaredADC in KNNScoringUtil.java to process the query vector in FloatVector.SPECIES_PREFERRED.length()-wide chunks, accumulating squared differences and finishing with reduceLanes(ADD), with a scalar tail loop for the remainder. 
+3. Same rewrite for innerProductADC.
+
+Files modified:
+
+1. src/main/java/org/opensearch/knn/plugin/script/KNNScoringUtil.java
+2. build.gradle
+3. src/test/java/org/opensearch/knn/plugin/script/KNNScoringUtilTests.java
+4. CHANGELOG.md
+
+**Challenges Faced:**
+
+1. Unpacking bit-packed input into a float vector. The binary vector stores one bit per dimension, MSB-first (the original 7 - (i % 8) logic). Turning a run of lane-width bits into a FloatVector of 0.0/1.0 is the core difficulty, since there's no direct primitive for it. 
+2. Tail loop off-by-one. When the dimension isn't a multiple of the lane width, the leftover elements need the original scalar math. 
+3. Spotless / DCO failures on push. OpenSearch CI rejects unformatted code and unsigned commits. 
 
 ### Week [Y] Progress
 
@@ -124,7 +146,12 @@ Using UMPIRE framework (adapted):
 
 ### Code Changes
 
-- **Files modified:** [List]
+- **Files modified:**
+1. src/main/java/org/opensearch/knn/plugin/script/KNNScoringUtil.java
+2. build.gradle
+3. src/test/java/org/opensearch/knn/plugin/script/KNNScoringUtilTests.java
+4. CHANGELOG.md
+
 - **Key commits:** [Links to important commits]
 - **Approach decisions:** [Why you chose certain approaches]
 
