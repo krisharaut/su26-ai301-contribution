@@ -1,10 +1,10 @@
 # su26-ai301-contribution
 # Contribution [#1]: [Enhancement] Integrate SIMD with ADC distance computation
 
-**Contribution Number:** [3]  
+**Contribution Number:** [4]  
 **Student:** Krisha Raut  
 **Issue:** https://github.com/opensearch-project/k-NN/issues/3150  
-**Status:** Phase III Complete
+**Status:** Phase IV Complete
 
 ---
 
@@ -20,19 +20,57 @@ The OpenSearch kNN plugin also just feels relevant right now. Vector search is e
 
 ### Problem Description
 
-[In your own words, what's broken or missing?]
+Vectorizes the two ADC (Asymmetric Distance Computation) distance functions in
+`KNNScoringUtil` — `l2SquaredADC` and `innerProductADC` — using the Java Vector
+API (`jdk.incubator.vector`). Both methods previously ran a scalar loop over one
+dimension at a time; they now process the query vector in
+`FloatVector.SPECIES_PREFERRED`-wide chunks and reduce with `reduceLanes(ADD)`,
+with a scalar tail loop for dimensions that don't fill a full lane. This closes
+the TODOs the original author left in both methods.
+
+### Why this change
+
+The float/float and byte/byte distance paths already get SIMD acceleration for
+free by delegating to Lucene's `VectorUtil`. The ADC methods can't do that — their
+input is a full-precision float query vector against a bit-packed binary document
+vector (one bit per dimension), which Lucene has no primitive for — so they were
+left as a correct-but-slow scalar first pass with explicit TODOs pointing at
+`FloatVector.SPECIES_PREFERRED` and `reduceLanes()`. This PR implements that.
+
+### Issues Resolved
+
+Closes #3150
+
+### Testing
+
+Added parity unit tests in `KNNScoringUtilTests` that assert the vectorized
+results match the original scalar computation within a float tolerance, across
+dimensions that are and aren't multiples of the SIMD lane width (to exercise the
+tail loop), plus all-zero and all-one binary vectors as edge cases.
+
+
+### Check List
+- [ ] New functionality includes testing.
+- [ ] All tests pass.
+- [ ] New functionality has been documented / CHANGELOG updated.
+- [ ] Commits are signed per the DCO using `--signoff`.
+
 
 ### Expected Behavior
 
-[What should happen?]
+l2SquaredADC and innerProductADC should compute their distances using SIMD via the Java Vector API — processing multiple dimensions per CPU instruction with FloatVector.SPECIES_PREFERRED and reducing the accumulated lanes with reduceLanes(ADD). This mirrors how the non-ADC distance paths already get their speed: the float/float and byte/byte versions of l2Squared and innerProduct delegate to Lucene's VectorUtil, which is SIMD-accelerated internally. The ADC methods should reach comparable throughput on modern hardware while returning the same numerical results.
 
 ### Current Behavior
 
-[What actually happens?]
+Both methods run a plain scalar for loop over queryVector.length, handling one dimension per iteration. For each dimension i, the code computes the byte index (i / 8) and bit offset (7 - (i % 8)), extracts a single bit from the packed binary vector, and then either squares the difference (l2SquaredADC) or accumulates the product (innerProductADC). There's no batching and no vectorization — the TODO comment inside each method explicitly names this as inefficient and points to FloatVector.SPECIES_PREFERRED + reduceLanes() as the intended fix.
 
 ### Affected Components
 
-[Which parts of the codebase are involved?]
+src/main/java/org/opensearch/knn/plugin/script/KNNScoringUtil.java — holds l2SquaredADC, innerProductADC, and scoreWithADC (the dispatcher that routes the L2, inner product, and cosine space types to the two ADC methods).
+
+build.gradle — needs the --add-modules=jdk.incubator.vector JVM argument wired into the build/test config so the incubator Vector API resolves at compile and runtime, as the TODO comments call out.
+
+src/test/java/org/opensearch/knn/plugin/script/KNNScoringUtilTests.java — where the existing scoring-util tests live, so the new ADC correctness/parity tests belong there.
 
 ---
 
@@ -52,23 +90,17 @@ This one took a bit more time to get running than a typical project — OpenSear
 
 The "bug" here is less a crash and more a performance gap that the original author left with explicit TODOs. Running a microbenchmark (or just reading the code) makes it clear there's no batching happening.
 
-### Reproduction Evidence
-
-- **Commit showing reproduction:** [Link to commit in your fork]
-- **Screenshots/logs:** [If applicable]
-- **My findings:** [What you discovered during reproduction]
-
 ---
 
 ## Solution Approach
 
 ### Analysis
 
-[Your analysis of the root cause - what's causing the issue?]
+This isn't a bug in the usual sense — there's no crash or wrong answer. The root cause is simply that the ADC methods were written as a correct-but-slow first pass, with the optimization deliberately deferred (the TODO comments say as much). The scalar loop handles one dimension per iteration, so it can't take advantage of modern CPUs that process 4, 8, or 16 floats in a single SIMD instruction. The reason these methods couldn't just borrow the existing fast path is the input format: the query is a full-precision float[] while the document vector is bit-packed (one bit per dimension, MSB-first within each byte). Lucene's VectorUtil — which the float/float and byte/byte distance methods delegate to for their speed — has no primitive for that mixed float-vs-packed-bits case, so ADC fell back to a hand-written scalar loop. The speedup therefore hinges on cheaply turning a run of packed bits into a FloatVector of 0.0/1.0 values so it can be combined with a chunk of the query vector in one vector operation and then reduced.
 
 ### Proposed Solution
 
-[High-level description of your fix approach]
+Rewrite both methods to iterate in chunks of FloatVector.SPECIES_PREFERRED.length() instead of one element at a time. For each chunk: load the matching slice of the query vector into a FloatVector, materialize the corresponding bits as a FloatVector of 0/1 values, and then — for l2SquaredADC, subtract, square, and accumulate into a running vector; for innerProductADC, multiply and accumulate — finishing each with reduceLanes(ADD). A scalar tail loop handles the leftover dimensions when the length isn't a multiple of the lane width, using the same math as the original so results stay identical. Alongside the code, add --add-modules=jdk.incubator.vector to build.gradle so the incubator API resolves. The dispatcher scoreWithADC stays untouched since it only forwards to these two methods.
 
 ### Implementation Plan
 
